@@ -1,0 +1,11 @@
+# chefsync-agent runtime dependencies
+Flask>=3.0
+flask-cors>=4.0
+requests>=2.31
+pillow>=10.0
+pystray>=0.19          # system tray icon (optional; agent runs headless without it)
+
+# Platform-specific printing backends (install as needed):
+#   Windows:        pywin32
+#   Linux:          pycups
+#   macOS:          none — uses the built-in lp/lpstat CLI
