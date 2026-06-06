@@ -4,38 +4,54 @@ Claims pending print_jobs for this agent's location via claim_print_job
 (FOR UPDATE SKIP LOCKED, so two agents never grab the same job), prints them
 through the local dispatcher, and reports the outcome via mark_print_job_status.
 
-Environment:
-  CHEFSYNC_SUPABASE_URL          https://<project>.supabase.co
-  CHEFSYNC_SUPABASE_KEY          service_role key  (LOCAL/SERVER ONLY — never ship to a browser)
-  CHEFSYNC_LOCATION_ID           location uuid this agent prints for
-  CHEFSYNC_AGENT_DEVICE_ID       (optional) override the persisted device id
-  CHEFSYNC_AGENT_POLL_INTERVAL_MS (optional) poll interval in ms (default 3000)
+Configuration (highest priority first):
+  1. Environment variables: CHEFSYNC_SUPABASE_URL, CHEFSYNC_SUPABASE_KEY,
+     CHEFSYNC_LOCATION_ID, CHEFSYNC_AGENT_DEVICE_ID, CHEFSYNC_AGENT_POLL_INTERVAL_MS
+  2. Config file (see agent_config.py for search paths)
 
-claim_print_job / mark_print_job_status are GRANTed to service_role, so the
-service-role key is required (the RPCs need to bypass RLS and run for any
-business at this location). Keep the key on the machine running the agent only.
+The anon key (NEXT_PUBLIC_SUPABASE_ANON_KEY) is sufficient — see
+10_agent_anon_grants.sql which grants claim_print_job / mark_print_job_status
+to the anon role. Keep the key on the agent machine only.
 """
-import os
 import threading
 import time
+from typing import Optional
 
 import requests
 
 from services.device import get_device_id
+from services.agent_config import load_file_config, resolve, config_search_paths
+
+# ---------------------------------------------------------------------------
+# Global poller state — modified only under _poller_lock
+# ---------------------------------------------------------------------------
+_poller_lock = threading.Lock()
+_poller_stop_event = threading.Event()
+_poller_stop_event.set()  # starts as "stopped"
+_poller_thread: Optional[threading.Thread] = None
+
+# How often (seconds) the loop runs recover_stuck_jobs as a self-heal step
+_RECOVERY_INTERVAL_SEC = 300  # 5 minutes
 
 
 def _config():
-    interval_ms = os.getenv("CHEFSYNC_AGENT_POLL_INTERVAL_MS")
+    fc = load_file_config()
+    url = resolve(["CHEFSYNC_SUPABASE_URL"], ["supabase_url", "url"], fc).rstrip("/")
+    key = resolve(["CHEFSYNC_SUPABASE_KEY"], ["supabase_key", "service_role_key", "key"], fc)
+    location_id = resolve(["CHEFSYNC_LOCATION_ID"], ["location_id"], fc)
+    device_id = resolve(["CHEFSYNC_AGENT_DEVICE_ID"], ["device_id", "agent_device_id"], fc) or get_device_id()
+    interval_ms = resolve(["CHEFSYNC_AGENT_POLL_INTERVAL_MS"], ["poll_interval_ms"], fc)
     if interval_ms:
         interval = max(0.5, int(interval_ms) / 1000.0)
     else:
-        interval = float(os.getenv("CHEFSYNC_POLL_INTERVAL", "3"))
+        interval = float(resolve(["CHEFSYNC_POLL_INTERVAL"], ["poll_interval"], fc, "3"))
     return {
-        "url": os.getenv("CHEFSYNC_SUPABASE_URL", "").rstrip("/"),
-        "key": os.getenv("CHEFSYNC_SUPABASE_KEY", ""),
-        "location_id": os.getenv("CHEFSYNC_LOCATION_ID", ""),
-        "device_id": os.getenv("CHEFSYNC_AGENT_DEVICE_ID") or get_device_id(),
+        "url": url,
+        "key": key,
+        "location_id": location_id,
+        "device_id": device_id,
         "interval": interval,
+        "source": fc.get("__source__"),
     }
 
 
@@ -75,6 +91,23 @@ def mark_status(cfg, job_id, status, error=None):
     return _rpc(cfg, "mark_print_job_status", {
         "p_job_id": job_id, "p_status": status, "p_device_id": cfg["device_id"], "p_error": error,
     })
+
+
+def recover_stuck_jobs(cfg, logger, stuck_minutes=10):
+    """Reset print_jobs stuck in 'printing' for longer than stuck_minutes.
+
+    Called on poller startup and periodically in the loop to self-heal after
+    crashes between claim and mark.
+    """
+    try:
+        count = _rpc(cfg, "recover_stuck_print_jobs", {
+            "p_location_id": cfg["location_id"],
+            "p_stuck_minutes": stuck_minutes,
+        })
+        if count and int(count) > 0:
+            logger.warning("[poller] recovered %d stuck job(s) at location %s", int(count), cfg["location_id"][:8])
+    except Exception as exc:
+        logger.debug("[poller] recover_stuck_jobs: %s", exc)
 
 
 def resolve_printer(cfg, job):
@@ -135,24 +168,98 @@ def process_one_job(support, logger):
         return (final, job_id)
 
 
-def _poll_loop(support, logger):
+def _poll_loop(support, logger, stop_event: threading.Event):
     cfg = _config()
-    logger.info("[poller] started location=%s device=%s interval=%ss", cfg["location_id"][:8], cfg["device_id"][:8], cfg["interval"])
-    while True:
+    logger.info(
+        "[poller] started location=%s device=%s interval=%ss",
+        cfg["location_id"][:8], cfg["device_id"][:8], cfg["interval"],
+    )
+
+    # Self-heal: reset any jobs that were stuck from a previous crash
+    recover_stuck_jobs(cfg, logger)
+    last_recovery = time.monotonic()
+
+    while not stop_event.is_set():
         try:
             status, job_id = process_one_job(support, logger)
             if status is None:
-                time.sleep(cfg["interval"])  # queue empty -> wait
-            # else: loop immediately to drain the queue
+                # Queue empty: interruptible sleep (wakes immediately if stopped)
+                stop_event.wait(timeout=cfg["interval"])
+            # else: drain the queue without sleeping
+
+            # Periodic recovery check
+            if time.monotonic() - last_recovery > _RECOVERY_INTERVAL_SEC:
+                cfg = _config()  # re-read in case config was updated
+                recover_stuck_jobs(cfg, logger)
+                last_recovery = time.monotonic()
+
         except Exception as exc:
             logger.warning("[poller] loop error: %s", exc)
-            time.sleep(cfg["interval"])
+            stop_event.wait(timeout=cfg["interval"])
+
+    logger.info("[poller] stopped")
 
 
-def start_poller(support, logger):
+# ---------------------------------------------------------------------------
+# Public lifecycle API
+# ---------------------------------------------------------------------------
+
+def start_poller(support, logger) -> bool:
     """Start the poll loop in a daemon thread if configured. Returns True if started."""
+    global _poller_stop_event, _poller_thread
+
+    cfg = _config()
     if not is_enabled():
-        logger.info("[poller] disabled (set CHEFSYNC_SUPABASE_URL/KEY/LOCATION_ID to enable)")
+        missing = [n for n, v in (("supabase_url", cfg["url"]), ("supabase_key", cfg["key"]), ("location_id", cfg["location_id"])) if not v]
+        logger.warning("[poller] DISABLED — missing: %s", ", ".join(missing))
+        logger.warning("[poller] set env CHEFSYNC_SUPABASE_URL/KEY/LOCATION_ID, or create a config file at one of:")
+        for p in config_search_paths():
+            logger.warning("[poller]   - %s", p)
+        logger.warning('[poller] example: {"supabase_url":"https://<proj>.supabase.co","supabase_key":"<anon_key>","location_id":"<uuid>"}')
         return False
-    threading.Thread(target=_poll_loop, args=(support, logger), daemon=True).start()
+
+    with _poller_lock:
+        _poller_stop_event = threading.Event()
+        t = threading.Thread(target=_poll_loop, args=(support, logger, _poller_stop_event), daemon=True)
+        _poller_thread = t
+
+    logger.info(
+        "[poller] ENABLED via %s — location=%s device=%s",
+        cfg.get("source") or "environment", cfg["location_id"][:8], cfg["device_id"][:8],
+    )
+    t.start()
     return True
+
+
+def stop_poller(timeout=5.0) -> bool:
+    """Signal the poller to stop and wait up to `timeout` seconds. Returns True if stopped."""
+    global _poller_stop_event, _poller_thread
+    with _poller_lock:
+        event = _poller_stop_event
+        thread = _poller_thread
+
+    if event:
+        event.set()
+    if thread and thread.is_alive():
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
+    return True
+
+
+def restart_poller(support, logger) -> bool:
+    """Stop any running poller, reload config from disk/env, and start fresh.
+
+    Returns True if the new poller started successfully.
+    Called by POST /configure after saving new config to disk.
+    """
+    stop_poller()
+    return start_poller(support, logger)
+
+
+def poller_status() -> dict:
+    """Return current poller state for /config/status."""
+    with _poller_lock:
+        event = _poller_stop_event
+        thread = _poller_thread
+    running = bool(thread and thread.is_alive() and event and not event.is_set())
+    return {"running": running}

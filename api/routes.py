@@ -7,6 +7,8 @@ from services.printing.driver import print_text, print_image
 from services.printing.devices import discover_devices
 from services.printing.dispatch import print_job
 from services.device import get_device_id
+from services.agent_config import save_file_config, clear_file_config
+from services.db_poller import restart_poller, stop_poller, is_enabled, poller_status
 
 AGENT_NAME = "chefsync-agent"
 AGENT_VERSION = "1.0.0"
@@ -90,6 +92,68 @@ def register_routes(app):
         except Exception as exc:
             current_app.logger.error("test print failed: %s", exc)
             return jsonify({"ok": False, "job_id": data.get("job_id"), "error": str(exc)}), 500
+
+    # =========================================================================
+    # Configuration endpoints — called by the app's setup wizard
+    # =========================================================================
+
+    @app.route("/config/status", methods=["GET"])
+    def config_status():
+        from services.db_poller import _config
+        cfg = _config()
+        url = cfg.get("url") or ""
+        key = cfg.get("key") or ""
+        key_masked = (key[:8] + "…" + key[-4:]) if len(key) > 12 else ("***" if key else None)
+        status = poller_status()
+        return jsonify({
+            "configured": is_enabled(),
+            "poller_enabled": status["running"],
+            "location_id": cfg.get("location_id") or None,
+            "device_id": get_device_id(),
+            "supabase_url": url or None,
+            "key_masked": key_masked,
+        })
+
+    @app.route("/configure", methods=["POST"])
+    def configure():
+        data = request.get_json(silent=True) or {}
+        url = (data.get("supabase_url") or "").strip().rstrip("/")
+        key = (data.get("supabase_key") or "").strip()
+        location_id = (data.get("location_id") or "").strip()
+
+        if not url or not key or not location_id:
+            return jsonify({
+                "ok": False,
+                "error": "supabase_url, supabase_key and location_id are required",
+            }), 400
+
+        interval_ms = int(data.get("poll_interval_ms") or 3000)
+
+        path = save_file_config({
+            "supabase_url": url,
+            "supabase_key": key,
+            "location_id": location_id,
+            "poll_interval_ms": interval_ms,
+        })
+        current_app.logger.info("[configure] saved config to %s", path)
+
+        support = current_app.config["SUPPORT"]
+        enabled = restart_poller(support, current_app.logger)
+
+        return jsonify({
+            "ok": True,
+            "configured": True,
+            "poller_enabled": enabled,
+            "device_id": get_device_id(),
+            "location_id": location_id,
+        })
+
+    @app.route("/config/reset", methods=["POST"])
+    def config_reset():
+        stop_poller()
+        deleted = clear_file_config()
+        current_app.logger.info("[config/reset] config cleared (file existed: %s)", deleted)
+        return jsonify({"ok": True, "configured": False, "poller_enabled": False})
 
     # =========================================================================
     # legacy endpoints (kept for backward compatibility)

@@ -62,19 +62,52 @@ curl -X POST http://127.0.0.1:5321/print/test \
   -d '{"printer_id":"PRINTER_ID"}'
 ```
 
-## Supabase bridge
+## Supabase bridge (silent printing)
 
-If you want the agent to poll pending print jobs from Supabase, set:
+For the agent to claim and print pending jobs from Supabase it needs the project
+URL, a **service_role** key, and the location id. It reads these from environment
+variables OR a JSON config file (env wins).
+
+The `[poller] disabled` log on startup means none of these were found.
+
+### Option A — environment variables (dev)
 
 ```bash
 export CHEFSYNC_SUPABASE_URL=https://<project>.supabase.co
 export CHEFSYNC_SUPABASE_KEY=<service_role_key>
 export CHEFSYNC_LOCATION_ID=<location_uuid>
-export CHEFSYNC_POLL_INTERVAL=3
+export CHEFSYNC_AGENT_POLL_INTERVAL_MS=3000   # optional
+export CHEFSYNC_AGENT_DEVICE_ID=<uuid>          # optional
 python app.py
 ```
 
-The agent resolves the printer from `options.printer_name` first, then from `print_devices` using `print_device_id`.
+### Option B — config file (recommended for the Windows .exe)
+
+Copy `chefsync-agent.config.example.json` to `chefsync-agent.config.json` and
+fill it in. The agent searches, in order:
+
+1. `$CHEFSYNC_CONFIG_FILE` (explicit path)
+2. `chefsync-agent.config.json` next to the `.exe` (or the working dir in dev)
+3. `%APPDATA%\ChefSync\config.json`  (Windows)
+4. `~/.chefsync-agent/config.json`   (any OS)
+
+```json
+{
+  "supabase_url": "https://<project>.supabase.co",
+  "supabase_key": "<service_role key>",
+  "location_id": "<location uuid>",
+  "device_id": "",
+  "poll_interval_ms": 3000
+}
+```
+
+> ⚠️ The `supabase_key` is a **service_role** key — keep this file on the machine
+> running the agent only. Never put it in the web app / browser.
+
+On success you'll see `[poller] ENABLED via <source> — location=… device=…`.
+The `location_id` comes from the dashboard (Config → Impresoras shows the active
+location). The agent resolves the printer from `options.printer_name` first, then
+from `print_devices` using `print_device_id`.
 
 ## Contributing
 
