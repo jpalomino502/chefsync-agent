@@ -34,6 +34,10 @@ class AppConfig:
     icon_path: str
     default_dpi: int
     default_width_px: int
+    # HTTPS via mkcert — set CHEFSYNC_SSL_CERT + CHEFSYNC_SSL_KEY to enable.
+    # See ssl/README.md for setup instructions.
+    ssl_cert: str
+    ssl_key: str
 
 
 def load_config():
@@ -53,6 +57,8 @@ def load_config():
         icon_path=os.getenv("CHEFSYNC_ICON_PATH", "icon.png"),
         default_dpi=int(os.getenv("CHEFSYNC_DEFAULT_DPI", "203")),
         default_width_px=int(os.getenv("CHEFSYNC_DEFAULT_WIDTH_PX", "576")),
+        ssl_cert=os.getenv("CHEFSYNC_SSL_CERT", ""),
+        ssl_key=os.getenv("CHEFSYNC_SSL_KEY", ""),
     )
 
 
