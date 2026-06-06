@@ -33,6 +33,11 @@ _poller_thread: Optional[threading.Thread] = None
 # How often (seconds) the loop runs recover_stuck_jobs as a self-heal step
 _RECOVERY_INTERVAL_SEC = 300  # 5 minutes
 
+# How often (seconds) the agent publishes its presence (online + printers) so
+# the dashboard can show which agent is alive. Must be well under the frontend's
+# "online" threshold (~30s) so a healthy agent never flickers offline.
+_HEARTBEAT_INTERVAL_SEC = 15
+
 
 def _config():
     fc = load_file_config()
@@ -110,6 +115,36 @@ def recover_stuck_jobs(cfg, logger, stuck_minutes=10):
         logger.debug("[poller] recover_stuck_jobs: %s", exc)
 
 
+def send_heartbeat(cfg, support, logger):
+    """Publish this agent's presence + discovered printers via agent_heartbeat.
+
+    Best-effort: a heartbeat failure must never stop the print loop.
+    """
+    try:
+        import platform
+        import socket
+        from services.printing.devices import discover_devices
+
+        try:
+            printers = discover_devices(support)
+        except Exception:
+            printers = []
+        meta = {
+            "hostname": socket.gethostname(),
+            "platform": getattr(support, "system", platform.system()),
+            "agent_version": "1.0.0",
+        }
+        _rpc(cfg, "agent_heartbeat", {
+            "p_location_id": cfg["location_id"],
+            "p_device_id": cfg["device_id"],
+            "p_printers": printers,
+            "p_meta": meta,
+        })
+        logger.debug("[poller] heartbeat sent (%d printer(s))", len(printers))
+    except Exception as exc:
+        logger.debug("[poller] heartbeat failed: %s", exc)
+
+
 def resolve_printer(cfg, job):
     """Resolve the local printer name for a claimed job."""
     options = job.get("options") or {}
@@ -179,6 +214,10 @@ def _poll_loop(support, logger, stop_event: threading.Event):
     recover_stuck_jobs(cfg, logger)
     last_recovery = time.monotonic()
 
+    # Announce presence immediately so the dashboard shows the agent online
+    send_heartbeat(cfg, support, logger)
+    last_heartbeat = time.monotonic()
+
     while not stop_event.is_set():
         try:
             status, job_id = process_one_job(support, logger)
@@ -186,6 +225,11 @@ def _poll_loop(support, logger, stop_event: threading.Event):
                 # Queue empty: interruptible sleep (wakes immediately if stopped)
                 stop_event.wait(timeout=cfg["interval"])
             # else: drain the queue without sleeping
+
+            # Periodic presence heartbeat
+            if time.monotonic() - last_heartbeat > _HEARTBEAT_INTERVAL_SEC:
+                send_heartbeat(cfg, support, logger)
+                last_heartbeat = time.monotonic()
 
             # Periodic recovery check
             if time.monotonic() - last_recovery > _RECOVERY_INTERVAL_SEC:
