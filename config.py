@@ -38,7 +38,10 @@ class AppConfig:
 
 def load_config():
     return AppConfig(
-        host=os.getenv("CHEFSYNC_HOST", "127.0.0.1"),
+        # localhost is treated differently from 127.0.0.1 by Chrome's Private
+        # Network Access policy. Chrome may allow fetch() to "localhost" from
+        # a public HTTPS origin without triggering PNA blocking.
+        host=os.getenv("CHEFSYNC_HOST", "localhost"),
         port=int(os.getenv("CHEFSYNC_PORT", "5321")),
         cors_origins=_split_origins(os.getenv("CHEFSYNC_CORS_ORIGINS", "")),
         health_interval_sec=int(os.getenv("CHEFSYNC_HEALTH_INTERVAL_SEC", "10")),
