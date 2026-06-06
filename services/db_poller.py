@@ -146,7 +146,17 @@ def send_heartbeat(cfg, support, logger):
 
 
 def resolve_printer(cfg, job):
-    """Resolve the local printer name for a claimed job."""
+    """Resolve the local printer name for a claimed job.
+
+    Order:
+      1. options.printer_name / payload.printer_name — enqueue_print_job now
+         denormalizes the device's printer_ref here, so this is the normal path.
+      2. resolve_print_device(print_device_id) RPC — SECURITY DEFINER, granted to
+         anon, for OLD jobs that predate the denormalization. We CANNOT do a
+         direct REST select on print_devices: it is RLS-protected (TO
+         authenticated) and the agent uses the anon key, so the select returns
+         zero rows. That was the bug that made claimed jobs never print.
+    """
     options = job.get("options") or {}
     payload = job.get("payload") or {}
     name = options.get("printer_name") or payload.get("printer_name")
@@ -155,16 +165,12 @@ def resolve_printer(cfg, job):
     device_id = job.get("print_device_id")
     if device_id:
         try:
-            resp = requests.get(
-                f"{cfg['url']}/rest/v1/print_devices",
-                params={"id": f"eq.{device_id}", "select": "printer_ref,name"},
-                headers=_headers(cfg["key"]), timeout=10,
-            )
-            rows = resp.json() if resp.ok else []
-            if rows:
-                return rows[0].get("printer_ref") or rows[0].get("name")
-        except Exception:
-            pass
+            row = _rpc(cfg, "resolve_print_device", {"p_device_id": device_id})
+            if row:
+                return row.get("printer_ref") or row.get("name")
+        except Exception as exc:
+            # leave it to the caller to mark the job failed with a clear message
+            raise RuntimeError(f"resolve_print_device failed: {exc}")
     return None
 
 
