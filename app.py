@@ -18,7 +18,16 @@ def create_app(app_config=None, support=None):
     config = app_config or load_config()
     support = support or PlatformSupport()
     app = Flask(__name__)
-    CORS(app, resources={r"/*": {"origins": config.cors_origins}})
+    # allow_private_network=True makes Flask-CORS respond with
+    # "Access-Control-Allow-Private-Network: true" when Chrome sends the PNA
+    # preflight from a public HTTPS origin (e.g. dashboard.chefsync.app) to a
+    # loopback address (127.0.0.1). Without this flag Flask-CORS defaults to
+    # "false" and Chrome blocks every request from production to the agent.
+    CORS(
+        app,
+        resources={r"/*": {"origins": config.cors_origins}},
+        allow_private_network=True,
+    )
     app.config["APP_CONFIG"] = config
     app.config["SUPPORT"] = support
     register_routes(app)

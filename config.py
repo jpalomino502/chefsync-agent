@@ -3,9 +3,23 @@ import tempfile
 from dataclasses import dataclass
 
 
+# Origins allowed by default — includes the production dashboard and common dev
+# ports. Override with CHEFSYNC_CORS_ORIGINS (comma-separated). Set to "*" to
+# allow all (useful in fully-offline/LAN deployments, less secure).
+_DEFAULT_ORIGINS = [
+    "https://dashboard.chefsync.app",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:3002",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://127.0.0.1:3002",
+]
+
+
 def _split_origins(value):
     if not value:
-        return ["*"]
+        return _DEFAULT_ORIGINS
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
