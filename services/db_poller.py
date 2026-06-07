@@ -141,8 +141,39 @@ def send_heartbeat(cfg, support, logger):
             "p_meta": meta,
         })
         logger.debug("[poller] heartbeat sent (%d printer(s))", len(printers))
+        # Materialize discovered printers as print_devices rows so the dashboard
+        # UI lists them automatically (the UI reads print_devices, not
+        # print_agents.printers). Best-effort: requires register_print_device
+        # (migration 17). The virtual printer asks to become default when the
+        # location has none yet, so first-run/demo printing works out of the box.
+        register_printers(cfg, printers, logger)
     except Exception as exc:
         logger.debug("[poller] heartbeat failed: %s", exc)
+
+
+def register_printers(cfg, printers, logger):
+    """Upsert each discovered printer into print_devices via register_print_device.
+
+    Idempotent (keyed by location+agent_device_id+printer_ref). Never raises.
+    """
+    for p in printers or []:
+        ref = p.get("id") or p.get("name")
+        if not ref:
+            continue
+        try:
+            _rpc(cfg, "register_print_device", {
+                "p_location_id": cfg["location_id"],
+                "p_agent_device_id": cfg["device_id"],
+                "p_printer_ref": ref,
+                "p_name": p.get("name") or ref,
+                "p_connection_type": p.get("connection_type") or "system",
+                "p_capabilities": p.get("capabilities") or {},
+                # only the virtual sink asks to auto-default (server applies it
+                # only when the location has no default yet)
+                "p_make_default": bool((p.get("capabilities") or {}).get("virtual")),
+            })
+        except Exception as exc:
+            logger.debug("[poller] register_print_device(%s) skipped: %s", ref, exc)
 
 
 def resolve_printer(cfg, job):
@@ -190,11 +221,13 @@ def process_one_job(support, logger):
 
     job_id = job.get("id")
     attempts = job.get("attempts")
-    logger.info("[poller] claimed job %s type=%s format=%s attempt=%s", job_id, job.get("type"), job.get("format"), attempts)
+    logger.info("[poller] claimed job=%s type=%s format=%s attempt=%s", job_id, job.get("type"), job.get("format"), attempts)
+    logger.info("[poller] options=%s print_device_id=%s", job.get("options"), job.get("print_device_id"))
 
     try:
         from services.printing.dispatch import print_job
         printer = resolve_printer(cfg, job)
+        logger.info("[poller] resolved printer_name=%r", printer)
         if not printer:
             raise RuntimeError("no printer resolved (set options.printer_name or print_devices.printer_ref)")
         print_job(support, printer, job.get("type"), job.get("format"), job.get("payload"), job.get("options"))
