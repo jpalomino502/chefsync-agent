@@ -231,17 +231,28 @@ def process_one_job(support, logger):
         logger.info("[poller] resolved printer_name=%r", printer)
         if not printer:
             raise RuntimeError("no printer resolved (set options.printer_name or print_devices.printer_ref)")
-        before_files = set(os.listdir(_virtual_sink_dir())) if _is_virtual(printer) else None
+        before_files = None
+        if _is_virtual(printer):
+            sink_dir = _virtual_sink_dir()
+            if os.path.isdir(sink_dir):
+                before_files = set(os.listdir(sink_dir))
+            else:
+                before_files = set()
+                logger.info("[poller] virtual sink dir does not exist yet, will create: %s", sink_dir)
         logger.info("[poller] dispatching type=%s format=%s printer=%r", job.get("type"), job.get("format"), printer)
         print_job(support, printer, job.get("type"), job.get("format"), job.get("payload"), job.get("options"))
         if _is_virtual(printer):
             sink_dir = _virtual_sink_dir()
-            after_files = set(os.listdir(sink_dir)) if os.path.isdir(sink_dir) else set()
-            new_prn = [f for f in (after_files - (before_files or set())) if f.endswith(".prn")]
-            if new_prn:
-                logger.info("[poller] virtual sink verified: %s created in %s", new_prn, sink_dir)
+            if os.path.isdir(sink_dir):
+                after_files = set(os.listdir(sink_dir))
             else:
-                logger.warning("[poller] virtual sink: no new .prn detected in %s after dispatch", sink_dir)
+                after_files = set()
+            created_files = after_files - (before_files or set())
+            if not created_files:
+                raise RuntimeError(
+                    f"Virtual printer did not create any output file in {sink_dir}"
+                )
+            logger.info("[poller] virtual sink verified: %s created in %s", sorted(created_files), sink_dir)
         marked = mark_status(cfg, job_id, "done")
         final = (marked or {}).get("status", "done")
         logger.info("[poller] job %s -> %s on '%s'", job_id, final, printer)

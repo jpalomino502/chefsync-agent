@@ -1,6 +1,6 @@
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # Origins allowed by default — includes the production dashboard and common dev
@@ -70,12 +70,21 @@ class VirtualPrinterConfig:
     right_margin_px: int
 
 
+def default_virtual_sink_dir():
+    return os.path.join(tempfile.gettempdir(), "chefsync-virtual-jobs")
+
+
+def get_virtual_sink_dir_from_env():
+    return (
+        os.getenv("CHEFSYNC_PRINT_SINK_DIR")
+        or os.getenv("CHEFSYNC_VP_JOBS_DIR")
+        or default_virtual_sink_dir()
+    )
+
+
 def load_virtual_printer_config():
     return VirtualPrinterConfig(
-        jobs_dir=os.getenv(
-            "CHEFSYNC_VP_JOBS_DIR",
-            "/tmp/chefsync-virtual-jobs",
-        ),
+        jobs_dir=get_virtual_sink_dir_from_env(),
         width_px=int(os.getenv("CHEFSYNC_VP_WIDTH_PX", "576")),
         left_margin_px=int(os.getenv("CHEFSYNC_VP_LEFT_MARGIN_PX", "16")),
         right_margin_px=int(os.getenv("CHEFSYNC_VP_RIGHT_MARGIN_PX", "16")),

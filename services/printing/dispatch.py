@@ -10,6 +10,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
+
+from config import get_virtual_sink_dir_from_env
 
 logger = logging.getLogger("chefsync.dispatch")
 
@@ -93,35 +96,49 @@ def _looks_base64(value):
 
 
 VIRTUAL_PRINTER_ID = "virtual"
+_VIRTUAL_ALIASES = {
+    "virtual",
+    "virtual printer",
+    "virtual (file sink)",
+    "chefsync virtual",
+    "chefsync virtual printer",
+}
 
 
 def _virtual_sink_dir():
-    d = os.getenv("CHEFSYNC_PRINT_SINK_DIR")
-    if d:
-        return d
-    return "/tmp/chefsync-virtual-jobs"
+    return get_virtual_sink_dir_from_env()
 
 
 def _is_virtual(printer_name):
-    return str(printer_name).lower() == VIRTUAL_PRINTER_ID
+    if not printer_name:
+        return False
+    return str(printer_name).strip().lower() in _VIRTUAL_ALIASES
 
 
 def _send_raw(support, printer_name, data, title="ChefSync"):
     n = len(data)
     if _is_virtual(printer_name):
         out_dir = _virtual_sink_dir()
-        os.makedirs(out_dir, exist_ok=True)
-        existing = os.listdir(out_dir)
-        path = os.path.join(out_dir, f"{title.replace(' ', '_')}-{os.getpid()}-{len(existing)}.prn")
-        logger.info("[dispatch] backend=virtual_sink dir=%s bytes=%d", out_dir, n)
+
+        try:
+            Path(out_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.error("[dispatch] cannot create virtual sink dir %s: %s", out_dir, exc)
+            raise RuntimeError(f"Cannot create virtual sink directory {out_dir}: {exc}") from exc
+
+        existing = list(Path(out_dir).glob("*.prn"))
+        safe_title = str(title or "ChefSync").replace(" ", "_")
+        path = Path(out_dir) / f"{safe_title}-{os.getpid()}-{len(existing)}.prn"
+
+        logger.info("[dispatch] backend=virtual_sink dir=%s file=%s bytes=%d", out_dir, path, n)
+
         with open(path, "wb") as handle:
             handle.write(data)
-        if not os.path.isfile(path):
-            raise RuntimeError(f"[virtual_sink] file not found after write: {path}")
-        written = os.path.getsize(path)
-        if written != n:
-            raise RuntimeError(f"[virtual_sink] size mismatch: wrote {n} bytes but file is {written} bytes: {path}")
-        logger.info("[virtual_sink] wrote file=%s bytes=%d (verified)", path, written)
+
+        if not path.exists() or path.stat().st_size <= 0:
+            raise RuntimeError(f"Virtual print file was not created correctly: {path}")
+
+        logger.info("[virtual_sink] wrote file=%s bytes=%d (verified)", path, path.stat().st_size)
         return
 
     if getattr(support, "is_windows", False) and support.win32print is not None:
