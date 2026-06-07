@@ -74,7 +74,7 @@ def load_virtual_printer_config():
     return VirtualPrinterConfig(
         jobs_dir=os.getenv(
             "CHEFSYNC_VP_JOBS_DIR",
-            os.path.join(tempfile.gettempdir(), "chefsync-virtual-jobs"),
+            "/tmp/chefsync-virtual-jobs",
         ),
         width_px=int(os.getenv("CHEFSYNC_VP_WIDTH_PX", "576")),
         left_margin_px=int(os.getenv("CHEFSYNC_VP_LEFT_MARGIN_PX", "16")),

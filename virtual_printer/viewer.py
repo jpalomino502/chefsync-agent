@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 import threading
 import time
@@ -9,6 +10,8 @@ from PIL import Image, ImageTk, ImageFont
 from config import load_virtual_printer_config
 from virtual_printer.server import serve, serve_raw, job_bases, read_prn_text
 from virtual_printer.render import render_preview_png, derive_width_px_from_data, text_line_width
+
+logger = logging.getLogger("chefsync.viewer")
 
 
 class ViewerApp:
@@ -57,7 +60,9 @@ class ViewerApp:
         self._schedule_refresh()
 
     def _start_server(self):
+        logger.info("[viewer] starting LPD server on port 5515")
         threading.Thread(target=serve, args=("0.0.0.0", 5515, self.config.jobs_dir, self.lpd_server_ref), daemon=True).start()
+        logger.info("[viewer] starting RAW server on port 9100")
         threading.Thread(target=serve_raw, args=("0.0.0.0", 9100, self.config.jobs_dir, self.raw_server_ref), daemon=True).start()
 
     def _schedule_refresh(self):
@@ -65,8 +70,13 @@ class ViewerApp:
         self.root.after(1000, self._schedule_refresh)
 
     def _refresh_jobs(self):
-        bases = job_bases(self.config.jobs_dir)
+        try:
+            bases = job_bases(self.config.jobs_dir)
+        except Exception as exc:
+            logger.error("[viewer] scanning dir %s: %s", self.config.jobs_dir, exc)
+            return
         if bases != self.jobs:
+            logger.info("[viewer] detected %d job(s) in %s (was %d)", len(bases), self.config.jobs_dir, len(self.jobs))
             self.jobs = bases
             self.listbox.delete(0, tk.END)
             for base in self.jobs:
@@ -87,18 +97,23 @@ class ViewerApp:
     def _display_job(self, base):
         png = base + ".png"
         data, _ = read_prn_text(base)
+        logger.info("[viewer] rendering %s (%d bytes) -> %s", os.path.basename(base), len(data), os.path.basename(png))
         width = self.width_px
         if self.auto_var.get() == 1:
             width = derive_width_px_from_data(data, width)
             self.width_px = width
             self.canvas.config(width=width)
-        cuts = render_preview_png(
-            data,
-            png,
-            width,
-            self.config.left_margin_px,
-            self.config.right_margin_px,
-        )
+        try:
+            cuts = render_preview_png(
+                data,
+                png,
+                width,
+                self.config.left_margin_px,
+                self.config.right_margin_px,
+            )
+        except Exception as exc:
+            logger.error("[viewer] render error for %s: %s", os.path.basename(base), exc)
+            cuts = []
         try:
             img = Image.open(png)
         except Exception:

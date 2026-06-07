@@ -1,6 +1,9 @@
+import logging
 import os
 import socketserver
 from datetime import datetime
+
+logger = logging.getLogger("chefsync.vp_server")
 
 
 def _read_until_newline(conn):
@@ -36,6 +39,7 @@ def _save_job(jobs_dir, control_bytes, data_bytes):
             handle.write(control_bytes)
     with open(base + ".prn", "wb") as handle:
         handle.write(data_bytes)
+    logger.info("[vp_server] saved job %s (%d bytes) in %s", os.path.basename(base), len(data_bytes), jobs_dir)
     return base
 
 

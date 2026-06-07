@@ -13,6 +13,7 @@ The anon key (NEXT_PUBLIC_SUPABASE_ANON_KEY) is sufficient — see
 10_agent_anon_grants.sql which grants claim_print_job / mark_print_job_status
 to the anon role. Keep the key on the agent machine only.
 """
+import os
 import threading
 import time
 from typing import Optional
@@ -225,12 +226,22 @@ def process_one_job(support, logger):
     logger.info("[poller] options=%s print_device_id=%s", job.get("options"), job.get("print_device_id"))
 
     try:
-        from services.printing.dispatch import print_job
+        from services.printing.dispatch import print_job, _is_virtual, _virtual_sink_dir
         printer = resolve_printer(cfg, job)
         logger.info("[poller] resolved printer_name=%r", printer)
         if not printer:
             raise RuntimeError("no printer resolved (set options.printer_name or print_devices.printer_ref)")
+        before_files = set(os.listdir(_virtual_sink_dir())) if _is_virtual(printer) else None
+        logger.info("[poller] dispatching type=%s format=%s printer=%r", job.get("type"), job.get("format"), printer)
         print_job(support, printer, job.get("type"), job.get("format"), job.get("payload"), job.get("options"))
+        if _is_virtual(printer):
+            sink_dir = _virtual_sink_dir()
+            after_files = set(os.listdir(sink_dir)) if os.path.isdir(sink_dir) else set()
+            new_prn = [f for f in (after_files - (before_files or set())) if f.endswith(".prn")]
+            if new_prn:
+                logger.info("[poller] virtual sink verified: %s created in %s", new_prn, sink_dir)
+            else:
+                logger.warning("[poller] virtual sink: no new .prn detected in %s after dispatch", sink_dir)
         marked = mark_status(cfg, job_id, "done")
         final = (marked or {}).get("status", "done")
         logger.info("[poller] job %s -> %s on '%s'", job_id, final, printer)

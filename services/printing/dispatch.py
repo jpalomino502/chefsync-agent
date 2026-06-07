@@ -13,13 +13,26 @@ import tempfile
 
 logger = logging.getLogger("chefsync.dispatch")
 
-# Resolve `lp` to an absolute path ONCE. A daemonized agent often has a minimal
-# PATH (no /usr/bin), which made subprocess.run(["lp", ...]) fail with
-# FileNotFoundError -> "lp: No such file or directory" even though lp exists.
 _LP_BIN = shutil.which("lp") or next((p for p in ("/usr/bin/lp", "/bin/lp") if os.path.exists(p)), None)
 
-# ESC/POS cut + feed, appended to plain text jobs
 _FEED_CUT = b"\n\n\n\x1b\x64\x05\x1b\x69"
+
+
+def _available_lp_printers():
+    """Return set of CUPS printer names via lpstat, or None if lpstat unavailable."""
+    lpstat = shutil.which("lpstat")
+    if not lpstat:
+        return None
+    try:
+        proc = subprocess.run([lpstat, "-p"], capture_output=True, text=True, timeout=5)
+        names = set()
+        for line in proc.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in ("printer", "impresora"):
+                names.add(parts[1])
+        return names
+    except Exception:
+        return None
 
 
 def _strip_html(html):
@@ -31,7 +44,6 @@ def _strip_html(html):
 
 
 def build_text(job_type, payload):
-    """Build a simple monospace receipt from the payload (best-effort)."""
     payload = payload or {}
     if isinstance(payload.get("text"), str):
         return payload["text"]
@@ -80,13 +92,14 @@ def _looks_base64(value):
     return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9+/=\s]+", value or "")) and len(value) % 4 == 0 and len(value) > 16
 
 
-# Reserved printer id that writes the rendered job to a file instead of paper.
-# Useful for headless dev / CI and for an "is the pipeline working" check.
 VIRTUAL_PRINTER_ID = "virtual"
 
 
 def _virtual_sink_dir():
-    return os.getenv("CHEFSYNC_PRINT_SINK_DIR", os.path.join(tempfile.gettempdir(), "chefsync-virtual-jobs"))
+    d = os.getenv("CHEFSYNC_PRINT_SINK_DIR")
+    if d:
+        return d
+    return "/tmp/chefsync-virtual-jobs"
 
 
 def _is_virtual(printer_name):
@@ -95,18 +108,22 @@ def _is_virtual(printer_name):
 
 def _send_raw(support, printer_name, data, title="ChefSync"):
     n = len(data)
-    # Virtual file sink (no hardware) — writes the bytes to a file and succeeds.
     if _is_virtual(printer_name):
         out_dir = _virtual_sink_dir()
         os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, f"{title.replace(' ', '_')}-{os.getpid()}-{len(os.listdir(out_dir))}.prn")
+        existing = os.listdir(out_dir)
+        path = os.path.join(out_dir, f"{title.replace(' ', '_')}-{os.getpid()}-{len(existing)}.prn")
         logger.info("[dispatch] backend=virtual_sink dir=%s bytes=%d", out_dir, n)
         with open(path, "wb") as handle:
             handle.write(data)
-        logger.info("[virtual_sink] wrote file=%s bytes=%d", path, n)
+        if not os.path.isfile(path):
+            raise RuntimeError(f"[virtual_sink] file not found after write: {path}")
+        written = os.path.getsize(path)
+        if written != n:
+            raise RuntimeError(f"[virtual_sink] size mismatch: wrote {n} bytes but file is {written} bytes: {path}")
+        logger.info("[virtual_sink] wrote file=%s bytes=%d (verified)", path, written)
         return
 
-    # Windows RAW
     if getattr(support, "is_windows", False) and support.win32print is not None:
         logger.info("[dispatch] backend=win32 printer=%r bytes=%d", printer_name, n)
         handle = support.win32print.OpenPrinter(printer_name)
@@ -121,7 +138,6 @@ def _send_raw(support, printer_name, data, title="ChefSync"):
         logger.info("[win32] sent to spooler printer=%r bytes=%d", printer_name, n)
         return
 
-    # CUPS (pycups)
     if getattr(support, "cups", None) is not None:
         logger.info("[dispatch] backend=cups printer=%r bytes=%d", printer_name, n)
         conn = support.cups.Connection()
@@ -135,27 +151,42 @@ def _send_raw(support, printer_name, data, title="ChefSync"):
             os.unlink(tmp.name)
         return
 
-    # macOS / Linux CLI
+    lp_bin = shutil.which("lp") or next((p for p in ("/usr/bin/lp", "/bin/lp") if os.path.exists(p)), None)
     if not printer_name:
-        raise RuntimeError("printer_name required for lp")
-    if not _LP_BIN:
-        raise RuntimeError("lp binary not found on PATH (install CUPS / check PATH)")
-    args = [_LP_BIN, "-d", printer_name, "-o", "raw", "-t", title]
+        raise RuntimeError("printer_name is required for lp backend (no printer specified)")
+    if not lp_bin:
+        raise RuntimeError("lp binary not found — install CUPS or add /usr/bin to PATH")
+    printers = _available_lp_printers()
+    if printers is not None and printer_name not in printers:
+        avail = ", ".join(sorted(printers)) if printers else "(none)"
+        raise RuntimeError(
+            f"Printer {printer_name!r} not found in OS print queues. "
+            f"Available: [{avail}]. Install or share the printer first."
+        )
+    args = [lp_bin, "-d", printer_name, "-o", "raw", "-t", title]
     logger.info("[dispatch] backend=lp command=%s bytes=%d", " ".join(args), n)
     try:
         proc = subprocess.run(args, input=data, capture_output=True, timeout=30)
     except FileNotFoundError as exc:
-        raise RuntimeError("lp not executable: %s" % exc)
+        raise RuntimeError(f"lp binary not executable: {exc}")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"lp timed out after 30s sending to {printer_name!r}")
     out = proc.stdout.decode("utf-8", "ignore").strip()
     err = proc.stderr.decode("utf-8", "ignore").strip()
     logger.info("[lp] exit=%d stdout=%r stderr=%r", proc.returncode, out, err)
     if proc.returncode != 0:
-        # lp prints e.g. "lp: The printer or class does not exist." to stderr
-        raise RuntimeError(err or out or ("lp failed (exit %d)" % proc.returncode))
+        combined = err or out or f"lp failed (exit {proc.returncode})"
+        if "No such file" in combined or "does not exist" in combined or "unknown destination" in combined:
+            printers = _available_lp_printers() or set()
+            avail = ", ".join(sorted(printers)) if printers else "(none)"
+            raise RuntimeError(
+                f"Printer {printer_name!r} not found in OS print queues (lp error: {combined}). "
+                f"Available: [{avail}]"
+            )
+        raise RuntimeError(combined)
 
 
 def print_job(support, printer_name, job_type, fmt, payload, options=None):
-    """Render + send a job. Returns None on success, raises on failure."""
     fmt = (fmt or "text").lower()
     if not printer_name:
         raise ValueError("printer_id/printer_name is required")
@@ -169,5 +200,7 @@ def print_job(support, printer_name, job_type, fmt, payload, options=None):
     copies = int((options or {}).get("copies", 1) or 1)
     logger.info("[dispatch] print_job printer=%r type=%s fmt=%s copies=%d bytes=%d",
                 printer_name, job_type, fmt, copies, len(data))
-    for _ in range(max(1, copies)):
+    for i in range(max(1, copies)):
+        logger.info("[dispatch] sending copy %d/%d to %r", i + 1, max(1, copies), printer_name)
         _send_raw(support, printer_name, data, title=f"ChefSync {job_type}")
+    logger.info("[dispatch] print_job complete printer=%r copies=%d", printer_name, copies)
