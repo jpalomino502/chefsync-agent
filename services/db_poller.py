@@ -142,12 +142,6 @@ def send_heartbeat(cfg, support, logger):
             "p_meta": meta,
         })
         logger.debug("[poller] heartbeat sent (%d printer(s))", len(printers))
-        # Materialize discovered printers as print_devices rows so the dashboard
-        # UI lists them automatically (the UI reads print_devices, not
-        # print_agents.printers). Best-effort: requires register_print_device
-        # (migration 17). The virtual printer asks to become default when the
-        # location has none yet, so first-run/demo printing works out of the box.
-        register_printers(cfg, printers, logger)
     except Exception as exc:
         logger.debug("[poller] heartbeat failed: %s", exc)
 
